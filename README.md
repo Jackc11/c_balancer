@@ -1,6 +1,6 @@
 # c_balancer
 
-<strong>A blazingly fast load balancer written in C without any heap allocation</strong>
+<strong>A blazingly fast load balancer written in C without any heap allocation.\n</strong>
 <strong>This project is work in progress. Purpose of this is to learn optimization and a challenge to write C code without any heap allocation</strong>
 
 # How to build it
