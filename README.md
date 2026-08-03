@@ -11,3 +11,9 @@ cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 ```
+# How to use this load balancer
+<strong>First edit the config.h file in src directory then build it</strong>
+To run enter this
+```
+./balancer
+```
