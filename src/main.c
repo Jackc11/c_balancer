@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "http.h"
 #include "round_robin.h"
 #include "tcp_client.h"
 #include "tcp_server.h"
@@ -37,143 +38,124 @@ void print_logo(void) {
   printf("                                    \n");
 }
 
-void handle_client_connection(TcpServer* s, int fd, Server* servers, int servers_count) {
-  char buf[2048];
-  int res = recv(fd, buf, sizeof(buf), 0);
-  if (res >= 0) {
-    Server* server = get_next_server(&s->rr, servers, servers_count);
-    TcpClient c;
-    bool is_connected = tcp_client_connect(&c, server->ip, server->port);
-    if (!is_connected) {
-      const char* http_502_response = 
-        "HTTP/1.1 502 Bad Gateway\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: 42\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "Error 502: Backend server is unreachable.";
-          
-      send(fd, http_502_response, strlen(http_502_response), 0);
+void handle_502(int fd) {
+  const char* http_502_response = 
+    "HTTP/1.1 502 Bad Gateway\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 42\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "Error 502: Backend server is unreachable.";
       
-      epoll_ctl(fd, EPOLL_CTL_DEL, fd, NULL);
-      close(fd);
-      return;
-    }
+  send(fd, http_502_response, strlen(http_502_response), 0);
+  epoll_ctl(fd, EPOLL_CTL_DEL, fd, NULL);
+  close(fd);
+}
 
-    size_t n = strlen(buf);
-    size_t max_size = sizeof(buf);
+void handle_404(int fd) {
+  const char* http_404_response = 
+    "HTTP/1.1 404 Not Found\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 8\r\n"
+    "\r\n"
+    "Page not found.";
+  send(fd, http_404_response, strlen(http_404_response), 0);
+}
 
-    char *keep_alive_pos = strstr(buf, "Connection: keep-alive");
-    if (!keep_alive_pos) {
-      keep_alive_pos = strstr(buf, "connection: keep-alive");
-    }
-
-    // if (keep_alive_pos) {
-    //   memcpy(keep_alive_pos, "Connection: close     ", 22);
-    // } else {
-    //   // char *header_end = strstr(buf, "\r\n\r\n");
-    //   // if (header_end) {
-    //   //   size_t pos = header_end - buf;
-    //   //   // const char *insert_text = "\r\nConnection: close";
-        
-    //   //   // c_str_insert(buf, pos, insert_text, n, max_size);
-    //   //   // n += strlen(insert_text);
-    //   // }
-    // }
-
-    char *header_end = strstr(buf, "\r\n\r\n");
-    if (header_end) {
-      size_t pos = header_end - buf;
-      const char *insert_text = "\r\nX-Forwarded-Host: 127.0.0.1:3030";
-      
-      c_str_insert(buf, pos, insert_text, n, max_size);
-      n += strlen(insert_text);
-    }
-    printf("\n%s\n", buf);
-
-    send(c.fd, buf, sizeof(buf), 0);
-
-    char buf2[2048];
-    int bytes_received = 0;
-    while ((bytes_received = recv(c.fd, buf2, sizeof(buf2), 0)) > 0) {
-      int n = send(fd, buf2, bytes_received, 0);
-      // printf("Send response:\n%s\n", buf2);
-      if (n <= 0) {
-        printf("Connection to client was broken!\n");
-        break;
-      }
-    }
-
-    epoll_ctl(fd, EPOLL_CTL_DEL, fd, NULL);
-    close(fd);
-    close_connection(c.fd);
+void inster_x_forwarded_host_header(char* buf, size_t* buf_size, size_t max_size) {
+  char* header_end = strstr(buf, "\r\n\r\n");
+  if (header_end) {
+    size_t pos = header_end - buf;
+    char insert_text[64];
+    snprintf(insert_text, sizeof(insert_text), "\r\nX-Forwarded-Host: %s:%d", CONFIG.ip, CONFIG.port);
+    
+    c_str_insert(buf, pos, insert_text, *buf_size, max_size);
+    *buf_size += strlen(insert_text);
   }
 }
 
+bool receive_header_from_connection(int fd, char* buf, size_t buf_size) {
+  int res = recv(fd, buf, buf_size, 0); 
+  if (res <= 0) {
+    close(fd);
+    printf("Failed to receive header from connection");
+    return false;
+  }
+  return true;
+}
+
+void forward_buffer_to_backend(TcpServer* s, Server* server, HttpRequest* req, int fd, char* buf, size_t buf_size, size_t max_size) {
+  bool processed = false;
+  HttpHeader* h = NULL;
+  for (int i = 0; i < req->num_headers; i++) {
+    h = &req->headers[i];
+    if (strcasecmp(h->name, "Host") == 0) {
+      if (strncmp(h->value, CONFIG.domains[0].domain, strlen(h->value)) == 0) {
+        processed = true;
+
+        TcpClient c;
+        bool is_connected = tcp_client_connect(&c, server->ip, server->port);
+        if (!is_connected) {
+          handle_502(fd);
+          return;
+        }
+
+        inster_x_forwarded_host_header(buf, &buf_size, max_size);
+        printf("Sending request: %s\n", buf);
+
+        // Send the received header from connection
+        send(c.fd, buf, buf_size, 0);
+
+        char buf2[2048];
+        int bytes_received = 0;
+        while ((bytes_received = recv(c.fd, buf2, sizeof(buf2), 0)) > 0) {
+          int sent_bytes = send(fd, buf2, bytes_received, 0);
+          if (sent_bytes <= 0) {
+            printf("Connection to client was broken!\n");
+            break;
+          }
+        }
+        close_connection(c.fd);
+      }
+    }
+  }
+
+  if (!processed) {
+    handle_404(fd);
+  }
+
+  epoll_ctl(fd, EPOLL_CTL_DEL, fd, NULL);
+  close(fd);
+}
+
+void handle_client_connection(TcpServer* s, int fd, Server* servers, int servers_count) {
+  char buf[2048];
+  memset(buf, 0, sizeof(buf));
+
+  bool res = receive_header_from_connection(fd, buf, sizeof(buf));
+  if (!res) return;
+
+  size_t n = strlen(buf);
+  size_t max_size = sizeof(buf);
+
+  char temp_buf[2048]; 
+  memset(temp_buf, 0, sizeof(temp_buf));
+  memcpy(temp_buf, buf, n);
+
+  HttpRequest req;
+  parse_http_request(&req, temp_buf, n);
+
+  Server* server = get_next_server(&s->rr, servers, servers_count);
+  forward_buffer_to_backend(s, server, &req, fd, buf, n, max_size);
+}
+
 int main(int argc, char** argv) {
+  setvbuf(stdout, NULL, _IONBF, 0); 
+
   print_logo();
 
-  TcpServer server = tcp_server_listen("127.0.0.1", 3030, true);
+  TcpServer server = tcp_server_listen(CONFIG.ip, CONFIG.port, true);
   server.rr.current_index = 0;
   run_tcp_server(&server, handle_client_connection);
   return 0;
 }
-
-// int main(int argc, char** argv) {
-//   char http_request[] = 
-//     "GET /index.html HTTP/1.1\r\n"
-//     "Host: www.example.com\r\n"
-//     "User-Agent: C-Program/1.0\r\n"
-//     "Accept: text/html\r\n"
-//     "Connection: close\r\n"
-//     "\r\n";
-
-//   HttpRequest req = {
-//     .num_headers = 0,
-//   };
-//   bool is_succ = parse_http_request(&req, http_request, strlen(http_request));
-//   if (is_succ) {
-//     printf("Method: %s\n", method_to_str(req.method));
-//     printf("Target: %s\n", req.target);
-//     printf("Version: %s\n", http_ver_to_str(req.version));
-
-//     for (int i = 0; i < req.num_headers; i++) {
-//       HttpHeader* h = &req.headers[i];
-//       printf("%s: %s\n", h->name, h->value);
-//     }
-//   } else {
-//     printf("Failed to parse http request header\n");
-//   }
-
-//   printf("\n");
-//   printf("\n");
-//   printf("\n");
-
-//   char raw_response[] = 
-//     "HTTP/1.1 200 OK\r\n"
-//     "Server: CustomCServer/1.0\r\n"
-//     "Content-Type: text/html; charset=UTF-8\r\n"
-//     "Content-Length: 137\r\n"
-//     "Connection: close\r\n"
-//     "\r\n"
-//     "<!DOCTYPE html>\n"
-//     "<html>\n"
-//     "<head><title>C Server</title></head>\n"
-//     "<body><h1>Erfolg!</h1><p>Die HTML-Seite wurde geladen.</p></body>\n"
-//     "</html>";
-
-//   HttpResponse res;
-//   is_succ = parse_http_response(&res, raw_response, strlen(raw_response));
-//   if (is_succ) {
-//     printf("Version: %s\n", http_ver_to_str(res.version));
-//     printf("StatusCode: %s\n", http_code_to_str(res.status_code));
-//     for (int i = 0; i < res.num_headers; i++) {
-//       HttpHeader* h = &res.headers[i];
-//       printf("%s: %s\n", h->name, h->value);
-//     }
-//   } else {
-//     printf("Failed to parse http response header\n");
-//   }
-
-//   return 0;
-// }
